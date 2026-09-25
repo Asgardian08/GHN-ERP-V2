@@ -1,0 +1,8 @@
+{
+  "name": "GHN ERP Lite",
+  "description": "Sistem Operasi Peternakan Terintegrasi GHN Egg Farm Nusantara - Produksi, Kasir POS, Pre Order, Stok, Keuangan & Laporan Otomatis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
