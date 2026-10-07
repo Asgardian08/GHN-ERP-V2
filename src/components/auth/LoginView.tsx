@@ -27,7 +27,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLoginSuccess, data }) =>
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage(null);
 
@@ -38,16 +38,18 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLoginSuccess, data }) =>
 
     setIsLoading(true);
 
-    setTimeout(() => {
-      const result = db.login(email, password);
-      setIsLoading(false);
-
+    try {
+      const result = await db.login(email, password);
       if (result.success && result.user) {
         onLoginSuccess(result.user);
       } else {
         setErrorMessage(result.error || 'Email atau kata sandi tidak cocok.');
       }
-    }, 300);
+    } catch {
+      setErrorMessage('Terjadi kesalahan saat login. Silakan coba lagi.');
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   return (
