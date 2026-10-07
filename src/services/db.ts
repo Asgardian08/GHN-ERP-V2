@@ -875,6 +875,11 @@ function deepClone<T>(obj: T): T {
 class DatabaseService {
   private schema: DatabaseSchema;
   private listeners: Array<() => void> = [];
+  private authUser: User | null = null;
+  private remoteReady = false;
+  private remoteVersion = 0;
+  private remoteSyncInFlight = false;
+  private remoteSyncQueued = false;
 
   constructor() {
     this.schema = this.loadFromStorage();
@@ -987,7 +992,107 @@ class DatabaseService {
     for (const listener of this.listeners) {
       listener();
     }
+    void this.syncToRemote();
   }
+
+  private async initializeRemote(): Promise<void> {
+    try {
+      const sessionRes = await fetch('/api/ghn?action=session', {
+        credentials: 'include',
+      });
+      if (!sessionRes.ok) return;
+
+      const session = await sessionRes.json();
+      if (!session?.authenticated || !session.user) return;
+
+      this.authUser = session.user as User;
+      this.schema.currentUser = this.schema.users.find((u) => u.id === session.user.id) || session.user;
+
+      const stateRes = await fetch('/api/ghn?action=state', { credentials: 'include' });
+      if (stateRes.ok) {
+        const remote = await stateRes.json();
+        if (remote?.schema) {
+          this.schema = remote.schema as DatabaseSchema;
+          this.remoteVersion = Number(remote.version || 0);
+          this.remoteReady = true;
+          this.saveToStorage(this.schema);
+          this.emitListeners();
+          return;
+        }
+      }
+
+      // First migration on this device: seed the empty Neon state with the
+      // currently working local database instead of replacing it with demo data.
+      if (stateRes.status === 404) {
+        const initRes = await fetch('/api/ghn?action=state', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ schema: this.schema, version: 0 }),
+        });
+        if (initRes.ok) {
+          const created = await initRes.json();
+          this.remoteVersion = Number(created.version || 1);
+          this.remoteReady = true;
+        }
+      }
+
+      this.emitListeners();
+    } catch (error) {
+      console.warn('[GHN] Remote database initialization failed; keeping local cache.', error);
+    }
+  }
+
+  private emitListeners() {
+    for (const listener of this.listeners) {
+      listener();
+    }
+  }
+
+  private async syncToRemote(): Promise<void> {
+    if (!this.remoteReady || !this.authUser) return;
+    if (this.remoteSyncInFlight) {
+      this.remoteSyncQueued = true;
+      return;
+    }
+
+    this.remoteSyncInFlight = true;
+    try {
+      const response = await fetch('/api/ghn?action=state', {
+        method: 'PUT',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ schema: this.schema, version: this.remoteVersion }),
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        this.remoteVersion = Number(result.version || this.remoteVersion + 1);
+      } else if (response.status === 409) {
+        // Another device changed the authoritative database first. Reload it
+        // instead of silently overwriting the other device's data.
+        const latest = await fetch('/api/ghn?action=state', { credentials: 'include' });
+        if (latest.ok) {
+          const remote = await latest.json();
+          if (remote?.schema) {
+            this.schema = remote.schema as DatabaseSchema;
+            this.remoteVersion = Number(remote.version || this.remoteVersion);
+            this.saveToStorage(this.schema);
+            this.emitListeners();
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('[GHN] Remote sync failed; local cache remains available.', error);
+    } finally {
+      this.remoteSyncInFlight = false;
+      if (this.remoteSyncQueued) {
+        this.remoteSyncQueued = false;
+        void this.syncToRemote();
+      }
+    }
+  }
+
 
   public subscribe(listener: () => void) {
     this.listeners.push(listener);
@@ -1006,70 +1111,94 @@ class DatabaseService {
   // ==========================================
 
   public getAuthSession(): User | null {
-    try {
-      const sessionRaw = localStorage.getItem('ghn_erp_auth_session_v2');
-      if (!sessionRaw) return null;
-      const session = JSON.parse(sessionRaw);
-      const user = this.schema.users.find((u) => u.id === session.userId);
-      if (user && user.isActive !== false) {
-        return user;
-      }
-    } catch {
-      // ignore
-    }
-    return null;
+    return this.authUser;
   }
 
-  public login(email: string, password: string): { success: boolean; user?: User; error?: string } {
+  public async initialize(): Promise<User | null> {
+    await this.initializeRemote();
+    return this.authUser;
+  }
+
+  public async login(email: string, password: string): Promise<{ success: boolean; user?: User; error?: string }> {
     const cleanEmail = (email || '').trim().toLowerCase();
-    const user = this.schema.users.find((u) => u.email.trim().toLowerCase() === cleanEmail);
+    const localUser = this.schema.users.find((u) => u.email.trim().toLowerCase() === cleanEmail);
 
-    if (!user) {
-      return {
-        success: false,
-        error: 'Email tidak ditemukan dalam sistem GHN ERP Lite.',
-      };
+    try {
+      const response = await fetch('/api/ghn?action=login', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: cleanEmail, password }),
+      });
+      const result = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        // Keep the old local login as an offline fallback only when this browser
+        // already has a matching local account and the server cannot be used.
+        if (!response.status || response.status >= 500) {
+          if (localUser && localUser.isActive !== false && localUser.password === password) {
+            this.authUser = localUser;
+            this.schema.currentUser = localUser;
+            this.notify();
+            return { success: true, user: localUser };
+          }
+        }
+        return { success: false, error: result.error || 'Email atau kata sandi tidak cocok.' };
+      }
+
+      this.authUser = result.user as User;
+      this.schema.currentUser = this.schema.users.find((u) => u.id === result.user.id) || result.user;
+
+      // Load authoritative state if it already exists. If Neon is still empty,
+      // initialize it from this device's existing local data.
+      const stateRes = await fetch('/api/ghn?action=state', { credentials: 'include' });
+      if (stateRes.ok) {
+        const remote = await stateRes.json();
+        this.schema = remote.schema as DatabaseSchema;
+        this.remoteVersion = Number(remote.version || 0);
+      } else if (stateRes.status === 404) {
+        const initRes = await fetch('/api/ghn?action=state', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ schema: this.schema, version: 0 }),
+        });
+        if (!initRes.ok) {
+          const initResult = await initRes.json().catch(() => ({}));
+          return { success: false, error: initResult.error || 'Gagal menyiapkan database online GHN.' };
+        }
+        const created = await initRes.json();
+        this.remoteVersion = Number(created.version || 1);
+      }
+
+      this.remoteReady = true;
+      this.saveToStorage(this.schema);
+      this.emitListeners();
+      return { success: true, user: this.authUser };
+    } catch (error) {
+      console.error('[GHN] Login server error:', error);
+      if (localUser && localUser.isActive !== false && localUser.password === password) {
+        this.authUser = localUser;
+        this.schema.currentUser = localUser;
+        this.notify();
+        return { success: true, user: localUser };
+      }
+      return { success: false, error: 'Server database GHN tidak dapat dihubungi. Coba lagi.' };
     }
-
-    if (user.isActive === false) {
-      return {
-        success: false,
-        error: 'Akun Anda sedang dinonaktifkan. Silakan hubungi Owner.',
-      };
-    }
-
-    if (user.password !== password) {
-      return {
-        success: false,
-        error: 'Kata sandi tidak cocok. Silakan periksa kembali.',
-      };
-    }
-
-    // Save session
-    localStorage.setItem(
-      'ghn_erp_auth_session_v2',
-      JSON.stringify({ userId: user.id, loggedAt: new Date().toISOString() })
-    );
-
-    this.schema.currentUser = user;
-    this.notify();
-    return { success: true, user };
   }
 
   public logout(): void {
+    void fetch('/api/ghn?action=logout', { method: 'POST', credentials: 'include' }).catch(() => undefined);
+    this.authUser = null;
+    this.remoteReady = false;
     localStorage.removeItem('ghn_erp_auth_session_v2');
-    // Set currentUser to default or keep in memory
-    this.notify();
+    this.emitListeners();
   }
 
   // Set user role / active user directly
   public setCurrentUser(role: 'owner' | 'staff' | 'operator') {
     const user = this.schema.users.find((u) => u.role === role) || this.schema.users[0];
     this.schema.currentUser = user;
-    localStorage.setItem(
-      'ghn_erp_auth_session_v2',
-      JSON.stringify({ userId: user.id, loggedAt: new Date().toISOString() })
-    );
     this.notify();
   }
 
@@ -1077,10 +1206,6 @@ class DatabaseService {
     const user = this.schema.users.find((u) => u.id === userId);
     if (user) {
       this.schema.currentUser = user;
-      localStorage.setItem(
-        'ghn_erp_auth_session_v2',
-        JSON.stringify({ userId: user.id, loggedAt: new Date().toISOString() })
-      );
       this.notify();
     }
   }
