@@ -38,6 +38,12 @@ export default function App() {
       setData({ ...currentData });
       setSessionUser(db.getAuthSession());
     });
+
+    void db.initialize().then((user) => {
+      setData({ ...db.getData() });
+      setSessionUser(user);
+    });
+
     return () => unsubscribe();
   }, []);
 
